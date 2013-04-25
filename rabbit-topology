@@ -6,7 +6,7 @@
 # check mq201
 # dump mq201
 
-import urllib2
+import requests
 import json
 import copy
 
@@ -96,32 +96,11 @@ def find_no_consumers_no_ttl(queues):
             no_ttl.append(queue['name'])
     return no_ttl
 
-def fetch_json(address, path):
+def fetch_json(address, path, auth):
     (host, port) = host_port(address, 55672)
-
-    # create a password manager
-    password_mgr = urllib2.HTTPPasswordMgrWithDefaultRealm()
-
-    # Add the username and password.
-    # If we knew the realm, we could use it instead of None.
-    password_mgr.add_password(None, '%s:%s' % (host, port), 'guest', 'guest')
-    password_mgr.add_password(None, '%s:%s' % (host, 15672), 'guest', 'guest')
-    password_mgr.add_password(None, '%s:%s' % (host, 55672), 'guest', 'guest')
-    
-    handler = urllib2.HTTPBasicAuthHandler(password_mgr)
-    
-    # create "opener" (OpenerDirector instance)
-    opener = urllib2.build_opener(handler)
-    
-    # Install the opener.
-    # Now all calls to urllib2.urlopen use our opener.
-    urllib2.install_opener(opener)
-
     url = 'http://%s:%s%s' % (host, port, path)
-    r = urllib2.urlopen(url)
-    js = json.load(r)
-    r.close()
-    return js
+    r = requests.get(url, auth=auth)
+    return r.json()
 
 def diff(expected, actual, get_key):
     exp_map = {}
@@ -144,8 +123,8 @@ def diff(expected, actual, get_key):
             different=list(different)
             )
 
-def get_remote_topology(address):
-    exchanges = fetch_json(address, '/api/exchanges')
+def get_remote_topology(address, auth):
+    exchanges = fetch_json(address, '/api/exchanges', auth)
     exchanges = list(
             clean_exchanges(
                 skip_internal_exchanges(
@@ -154,12 +133,12 @@ def get_remote_topology(address):
                 )
             )
 
-    bindings = fetch_json(address, '/api/bindings')
+    bindings = fetch_json(address, '/api/bindings', auth)
     bindings = list(
             skip_empty_source(bindings)
             )
 
-    queues_raw = fetch_json(address, '/api/queues')
+    queues_raw = fetch_json(address, '/api/queues', auth)
     queues = list(
             skip_non_permanent(queues_raw)
             )
@@ -171,17 +150,18 @@ def get_remote_topology(address):
             )
     return topology
 
-def get_topology(file_or_host):
+def get_topology(file_or_host, auth):
     try:
         with open(file_or_host) as f:
             return json.load(f)
     except IOError:
         pass
-    return get_remote_topology(file_or_host)
+    return get_remote_topology(file_or_host, auth)
 
-def command_check(argv):
-    if len(argv) == 1:
-        topology = get_topology(argv[0])
+def command_check(args):
+    auth = (args.user, args.password)
+    if len(args.argv) == 1:
+        topology = get_topology(args.argv[0], auth)
         bindings = topology['bindings']
         queues = topology['queues']
         exchanges = topology['exchanges']
@@ -192,14 +172,16 @@ def command_check(argv):
                 )
         return warnings
 
-def command_dump(argv):
-    topology = get_remote_topology(argv[0])
+def command_dump(args):
+    auth = (args.user, args.password)
+    topology = get_remote_topology(args.argv[0], auth)
     topology['queues'] = list(clean_queues(topology['queues']))
     return topology
 
-def command_diff(argv):
-    expected = get_topology(argv[0])
-    actual = get_topology(argv[1])
+def command_diff(args):
+    auth = (args.user, args.password)
+    expected = get_topology(args.argv[0], auth)
+    actual = get_topology(args.argv[1], auth)
     actual['queues'] = list(clean_queues(actual['queues']))
 
     def get_name(d):
@@ -229,6 +211,8 @@ def main(argv):
             description='RabbitMQ Topology')
     parser.add_argument('command', help='dump, diff, check')
     parser.add_argument('argv', nargs='*', help='arguments')
+    parser.add_argument('-u', '--user', default='guest', help='basic auth username')
+    parser.add_argument('-p', '--password', default='guest', help='basic auth password')
     args = parser.parse_args()
     command = None
     if args.command == 'check':
@@ -239,7 +223,7 @@ def main(argv):
         command = command_diff
 
     if command:
-        result = command(args.argv)
+        result = command(args)
         json.dump(result, sys.stdout, indent=2)
         print
 
