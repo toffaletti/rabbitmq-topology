@@ -6,9 +6,14 @@
 # check mq201
 # dump mq201
 
+import urlparse
+import urllib
 import requests
 import json
 import copy
+import sys
+
+DEFAULT_PORT=55672
 
 def host_port(address, default_port):
     hostport = address.rsplit(':', 1)
@@ -97,7 +102,7 @@ def find_no_consumers_no_ttl(queues):
     return no_ttl
 
 def fetch_json(address, path, auth):
-    (host, port) = host_port(address, 55672)
+    (host, port) = host_port(address, DEFAULT_PORT)
     url = 'http://%s:%s%s' % (host, port, path)
     r = requests.get(url, auth=auth)
     return r.json()
@@ -203,13 +208,77 @@ def command_diff(args):
         warnings[thing] = diff(expected[thing], actual[thing], getter)
     return warnings
 
+def probe(address, auth):
+    (host, port) = host_port(address, DEFAULT_PORT)
+    url = 'http://%s:%s/api/overview' % (host, port)
+    r = requests.get(url, auth=auth)
+    url = urlparse.urlparse(r.url)
+    return (url.hostname, url.port)
+
+def put_api(host, port, auth, data, path, *args):
+    url = 'http://%s:%s' % (host, port)
+    url = url + (path % tuple([urllib.quote(arg, '') for arg in args]))
+    headers = {'Content-Type':'application/json'}
+    data=json.dumps(data)
+    return requests.put(url,
+            data=data,
+            auth=auth,
+            headers=headers,
+            )
+
+def post_api(host, port, auth, data, path, *args):
+    url = 'http://%s:%s' % (host, port)
+    url = url + (path % tuple([urllib.quote(arg, '') for arg in args]))
+    headers = {'Content-Type':'application/json'}
+    data=json.dumps(data)
+    return requests.post(url,
+            data=data,
+            auth=auth,
+            headers=headers,
+            )
+
+def create_exchange(host, port, auth, exchange):
+    return put_api(host, port, auth, exchange, '/api/exchanges/%s/%s',
+            exchange['vhost'],
+            exchange['name'])
+
+def create_queue(host, port, auth, queue):
+    return put_api(host, port, auth, queue, '/api/queues/%s/%s',
+            queue['vhost'],
+            queue['name'])
+
+def create_binding(host, port, auth, binding):
+    # TODO: support exchange->exchange binding?
+    return post_api(host, port, auth, binding, '/api/bindings/%s/e/%s/q/%s',
+            binding['vhost'],
+            binding['source'],
+            binding['destination'])
+
+def command_sync(args):
+    auth = (args.user, args.password)
+    topology = get_topology(args.argv[0], auth)
+    (host, port) = probe(args.argv[1], auth)
+    address = '%s:%s' % (host, port)
+    errors = []
+    for exchange in topology['exchanges']:
+        r = create_exchange(host, port, auth, exchange)
+        if r.status_code != 204:
+            errors.append((r.url, r.json()))
+    for queue in topology['queues']:
+        r = create_queue(host, port, auth, queue)
+        if r.status_code != 204:
+            errors.append((r.url, r.json()))
+    for binding in topology['bindings']:
+        r = create_binding(host, port, auth, binding)
+        if r.status_code != 201:
+            errors.append((r.url, r.json()))
+    return errors
 
 def main(argv):
     import argparse
-    import sys
     parser = argparse.ArgumentParser(
             description='RabbitMQ Topology')
-    parser.add_argument('command', help='dump, diff, check')
+    parser.add_argument('command', choices=['check', 'diff', 'dump', 'sync'])
     parser.add_argument('argv', nargs='*', help='arguments')
     parser.add_argument('-u', '--user', default='guest', help='basic auth username')
     parser.add_argument('-p', '--password', default='guest', help='basic auth password')
@@ -221,6 +290,8 @@ def main(argv):
         command = command_dump
     if args.command == 'diff':
         command = command_diff
+    if args.command == 'sync':
+        command = command_sync
 
     if command:
         result = command(args)
@@ -228,5 +299,4 @@ def main(argv):
         print
 
 if __name__ == '__main__':
-    import sys
     main(sys.argv)
