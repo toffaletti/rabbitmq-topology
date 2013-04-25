@@ -1,0 +1,248 @@
+#!/usr/bin/env python
+
+# commands:
+# diff expected actual
+# check topology.json
+# check mq201
+# dump mq201
+
+import urllib2
+import json
+import copy
+
+def host_port(address, default_port):
+    hostport = address.rsplit(':', 1)
+    if len(hostport) == 1:
+        return (hostport[0], int(default_port))
+    return (hostport[0], int(hostport[1]))
+
+def filter_keys(dicts, *keys):
+    for d in dicts:
+        d = copy.copy(d)
+        for key in keys:
+            d.pop(key, None)
+        yield d
+
+def clean_exchanges(exchanges):
+    return filter_keys(exchanges, 'message_stats_out', 'message_stats_in')
+
+def skip_internal_exchanges(exchanges):
+    for exchange in exchanges:
+        if exchange['name'] == '' or \
+                exchange['name'].startswith('amq.') \
+                or exchange['internal'] == True:
+            continue
+        yield exchange
+
+def skip_non_permanent(things):
+    # works for queues and exchanges
+    for thing in things:
+        if thing['durable'] == True and thing['auto_delete'] == False:
+            yield thing
+
+def skip_empty_source(bindings):
+    for binding in bindings:
+        if binding['source'] == '':
+            continue
+        yield binding
+
+def clean_queues(queues):
+    return filter_keys(queues,
+            'node',
+            'consumers',
+            'messages_details',
+            'messages', 
+            'backing_queue_status',
+            'message_stats',
+            'messages_unacknowledged_details',
+            'memory',
+            'messages_ready_details',
+            'messages_unacknowledged',
+            'messages_ready',
+            'idle_since'
+            )
+
+def find_unbound_queues(bindings, queues):
+    bound_queues = set()
+    unbound_queues = set()
+    for binding in bindings:
+        if binding['destination_type'] == 'queue':
+            bound_queues.add(binding['destination'])
+    for queue in queues:
+        if queue['name'] not in bound_queues:
+            unbound_queues.add(queue['name'])
+    return list(unbound_queues)
+
+def find_unbound_exchanges(bindings, queues, exchanges):
+    bound_exchanges = set()
+    unbound_exchanges = set()
+    for binding in bindings:
+        bound_exchanges.add(binding['source'])
+        if binding['destination_type'] == 'exchange':
+            bound_exchanges.add(binding['destination'])
+    for queue in queues:
+        if 'x-dead-letter-exchange' in queue['arguments']:
+            bound_exchanges.add(queue['arguments']['x-dead-letter-exchange'])
+    for exchange in exchanges:
+        if exchange['name'] not in bound_exchanges:
+            unbound_exchanges.add(exchange['name'])
+    return list(unbound_exchanges)
+
+def find_no_consumers_no_ttl(queues):
+    no_ttl = []
+    for queue in queues:
+        if queue.get('consumers', None) == 0 and \
+                queue['arguments'].get('x-message-ttl') == None:
+            no_ttl.append(queue['name'])
+    return no_ttl
+
+def fetch_json(address, path):
+    (host, port) = host_port(address, 55672)
+
+    # create a password manager
+    password_mgr = urllib2.HTTPPasswordMgrWithDefaultRealm()
+
+    # Add the username and password.
+    # If we knew the realm, we could use it instead of None.
+    password_mgr.add_password(None, '%s:%s' % (host, port), 'guest', 'guest')
+    password_mgr.add_password(None, '%s:%s' % (host, 15672), 'guest', 'guest')
+    password_mgr.add_password(None, '%s:%s' % (host, 55672), 'guest', 'guest')
+    
+    handler = urllib2.HTTPBasicAuthHandler(password_mgr)
+    
+    # create "opener" (OpenerDirector instance)
+    opener = urllib2.build_opener(handler)
+    
+    # Install the opener.
+    # Now all calls to urllib2.urlopen use our opener.
+    urllib2.install_opener(opener)
+
+    url = 'http://%s:%s%s' % (host, port, path)
+    r = urllib2.urlopen(url)
+    js = json.load(r)
+    r.close()
+    return js
+
+def diff(expected, actual, get_key):
+    exp_map = {}
+    act_map = {}
+    for ex in expected:
+        exp_map[get_key(ex)] = ex
+    for ac in actual:
+        act_map[get_key(ac)] = ac
+    exp_set = set(exp_map.keys())
+    act_set = set(act_map.keys())
+    missing = exp_set.difference(act_set)
+    extra = act_set.difference(exp_set)
+    different = []
+    for key in exp_set.intersection(act_set):
+        if exp_map[key] != act_map[key]:
+            different.append(key)
+    return dict(
+            missing=list(missing),
+            extra=list(extra),
+            different=list(different)
+            )
+
+def get_remote_topology(address):
+    exchanges = fetch_json(address, '/api/exchanges')
+    exchanges = list(
+            clean_exchanges(
+                skip_internal_exchanges(
+                    skip_non_permanent(exchanges)
+                    )
+                )
+            )
+
+    bindings = fetch_json(address, '/api/bindings')
+    bindings = list(
+            skip_empty_source(bindings)
+            )
+
+    queues_raw = fetch_json(address, '/api/queues')
+    queues = list(
+            skip_non_permanent(queues_raw)
+            )
+
+    topology = dict(
+            exchanges=exchanges,
+            bindings=bindings,
+            queues=queues
+            )
+    return topology
+
+def get_topology(file_or_host):
+    try:
+        with open(file_or_host) as f:
+            return json.load(f)
+    except IOError:
+        pass
+    return get_remote_topology(file_or_host)
+
+def command_check(argv):
+    if len(argv) == 1:
+        topology = get_topology(argv[0])
+        bindings = topology['bindings']
+        queues = topology['queues']
+        exchanges = topology['exchanges']
+        warnings = dict(
+                unbound_queues=find_unbound_queues(bindings, queues),
+                unbound_exchanges=find_unbound_exchanges(bindings, queues, exchanges),
+                no_consumers_no_ttl=find_no_consumers_no_ttl(skip_non_permanent(queues)),
+                )
+        return warnings
+
+def command_dump(argv):
+    topology = get_remote_topology(argv[0])
+    topology['queues'] = list(clean_queues(topology['queues']))
+    return topology
+
+def command_diff(argv):
+    expected = get_topology(argv[0])
+    actual = get_topology(argv[1])
+    actual['queues'] = list(clean_queues(actual['queues']))
+
+    def get_name(d):
+        return d['name']
+    def get_bind_name(d):
+        return '%s->%s:%s' % (
+                d['source'],
+                d['destination'],
+                d['destination_type']
+                )
+
+    warnings = {}
+    ops = (
+            ('exchanges', get_name),
+            ('queues', get_name),
+            ('bindings', get_bind_name),
+            )
+    for (thing, getter) in ops:
+        warnings[thing] = diff(expected[thing], actual[thing], getter)
+    return warnings
+
+
+def main(argv):
+    import argparse
+    import sys
+    parser = argparse.ArgumentParser(
+            description='RabbitMQ Topology')
+    parser.add_argument('command', help='dump, diff, check')
+    parser.add_argument('argv', nargs='*', help='arguments')
+    args = parser.parse_args()
+    command = None
+    if args.command == 'check':
+        command = command_check
+    if args.command == 'dump':
+        command = command_dump
+    if args.command == 'diff':
+        command = command_diff
+
+    if command:
+        result = command(args.argv)
+        json.dump(result, sys.stdout, indent=2)
+        print
+
+if __name__ == '__main__':
+    import sys
+    main(sys.argv)
