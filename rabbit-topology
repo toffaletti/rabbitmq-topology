@@ -15,6 +15,35 @@ import sys
 
 DEFAULT_PORT=55672
 
+def graph_style(style):
+    return ''.join([
+        '[',
+        ','.join(['%s="%s"' % (k, v) for (k, v) in style.iteritems()]),
+        ']'
+        ])
+
+def graph_node(prefix, name, style):
+    template =  \
+    'subgraph "cluster_{prefix}_{name}" {{\n' \
+    'label="{name}";\n' \
+    'color=transparent;\n' \
+    '"{prefix}_{name}" {style};\n' \
+    '}}\n\n'
+    return template.format(prefix=prefix, 
+            name=name,
+            style=graph_style(style))
+
+def graph_bind_nodes(source_type, source, destination_type, destination,
+        style='solid'):
+    return \
+            '{source_type}_{source} -> {dest_type}_{dest} {style};\n'.format(
+                    source_type=source_type,
+                    source=source,
+                    dest_type=destination_type,
+                    dest=destination,
+                    style=graph_style(style)
+                    )
+
 def host_port(address, default_port):
     hostport = address.rsplit(':', 1)
     if len(hostport) == 1:
@@ -274,11 +303,67 @@ def command_sync(args):
             errors.append((r.url, r.json()))
     return errors
 
+def command_graph(args):
+    auth = (args.user, args.password)
+    topology = get_topology(args.argv[0], auth)
+    exchanges = [
+            graph_node(
+                prefix='X',
+                name=exchange['name'],
+                style=dict(label='', color='green', shape='ellipse'),
+                )
+            for exchange in topology['exchanges']
+            ]
+    queues = [
+            graph_node(
+                prefix='Q',
+                name=queue['name'],
+                style=dict(label='', color='red', shape='record'),
+                )
+            for queue in topology['queues']
+            ]
+    bindings = [
+            graph_bind_nodes(
+                'X',
+                b['source'],
+                'Q',
+                b['destination'],
+                style=dict(label=b['routing_key']),
+                )
+            for b in topology['bindings']
+            ]
+    dead_letter_bindings = []
+    for queue in topology['queues']:
+        if 'x-dead-letter-exchange' in queue['arguments']:
+            dead_letter_bindings.append(dict(
+                source=queue['name'],
+                destination=queue['arguments']['x-dead-letter-exchange'],
+                routing_key='')
+                )
+    bindings.extend([
+            graph_bind_nodes(
+                'Q',
+                b['source'],
+                'X',
+                b['destination'],
+                style=dict(label=b['routing_key'],style='dotted'),
+                )
+            for b in dead_letter_bindings
+            ])
+    return ''.join([
+        'digraph {\n',
+        'bgcolor=transparent;\n',
+        'truecolor=true;\n',
+        'rankdir=LR;\n',
+        'node [style="filled"];\n\n', 
+        ''.join(map(''.join, [exchanges, queues, bindings])),
+        '}'])
+
 def main(argv):
     import argparse
     parser = argparse.ArgumentParser(
             description='RabbitMQ Topology')
-    parser.add_argument('command', choices=['check', 'diff', 'dump', 'sync'])
+    parser.add_argument('command', choices=['check', 'diff', 'dump', 'graph', 'sync'])
     parser.add_argument('argv', nargs='*', help='arguments')
     parser.add_argument('-u', '--user', default='guest', help='basic auth username')
     parser.add_argument('-p', '--password', default='guest', help='basic auth password')
@@ -292,10 +377,15 @@ def main(argv):
         command = command_diff
     if args.command == 'sync':
         command = command_sync
+    if args.command == 'graph':
+        command = command_graph
 
     if command:
         result = command(args)
-        json.dump(result, sys.stdout, indent=2)
+        if isinstance(result, basestring):
+            sys.stdout.write(result)
+        else:
+            json.dump(result, sys.stdout, indent=2)
         print
 
 if __name__ == '__main__':
