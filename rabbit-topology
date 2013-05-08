@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 
-# commands:
-# diff expected actual
+# example commands:
+# dump mq201 > topology.json
+# diff topology.json mq201
 # check topology.json
 # check mq201
-# dump mq201
+# graph topology.json > topology.dot
+# sync topology.json mq201
 
 import urlparse
 import urllib
@@ -16,6 +18,7 @@ import sys
 DEFAULT_PORT=55672
 
 def graph_style(style):
+    """generate style string from dict"""
     return ''.join([
         '[',
         ','.join(['%s="%s"' % (k, v) for (k, v) in style.iteritems()]),
@@ -23,6 +26,7 @@ def graph_style(style):
         ])
 
 def graph_node(prefix, name, style):
+    """generate a subgraph node for an exchange or queue"""
     template =  \
     'subgraph "cluster_{prefix}_{name}" {{\n' \
     'label="{name}";\n' \
@@ -33,8 +37,8 @@ def graph_node(prefix, name, style):
             name=name,
             style=graph_style(style))
 
-def graph_bind_nodes(source_type, source, destination_type, destination,
-        style='solid'):
+def graph_bind_nodes(source_type, source, destination_type, destination, style):
+    """generate graph edge for rabbit binding"""
     return \
             '{source_type}_{source} -> {dest_type}_{dest} {style};\n'.format(
                     source_type=source_type,
@@ -45,12 +49,14 @@ def graph_bind_nodes(source_type, source, destination_type, destination,
                     )
 
 def host_port(address, default_port):
+    """split host and port. return (host, port)"""
     hostport = address.rsplit(':', 1)
     if len(hostport) == 1:
         return (hostport[0], int(default_port))
     return (hostport[0], int(hostport[1]))
 
 def filter_keys(dicts, *keys):
+    """generate a copy of the list of dicts with keys removed"""
     for d in dicts:
         d = copy.copy(d)
         for key in keys:
@@ -58,9 +64,11 @@ def filter_keys(dicts, *keys):
         yield d
 
 def clean_exchanges(exchanges):
+    """remove non-config keys from exchanges in list"""
     return filter_keys(exchanges, 'message_stats_out', 'message_stats_in')
 
 def skip_internal_exchanges(exchanges):
+    """generator that skips the internal rabbit exchanges"""
     for exchange in exchanges:
         if exchange['name'] == '' or \
                 exchange['name'].startswith('amq.') \
@@ -69,18 +77,21 @@ def skip_internal_exchanges(exchanges):
         yield exchange
 
 def skip_non_permanent(things):
+    """generator that skips non-durable and auto-delete exchanges or queues"""
     # works for queues and exchanges
     for thing in things:
         if thing['durable'] == True and thing['auto_delete'] == False:
             yield thing
 
 def skip_empty_source(bindings):
+    """generator that skips bindings with no source"""
     for binding in bindings:
         if binding['source'] == '':
             continue
         yield binding
 
 def clean_queues(queues):
+    """remove non-config keys from queues in list"""
     return filter_keys(queues,
             'node',
             'consumers',
@@ -93,10 +104,18 @@ def clean_queues(queues):
             'messages_ready_details',
             'messages_unacknowledged',
             'messages_ready',
-            'idle_since'
+            'idle_since',
+            'active_consumers',
+            'policy',
+            'slave_nodes',
             )
 
+def clean_bindings(bindings):
+    """remove non-config keys from bindings in list"""
+    return filter_keys(bindings, 'properties_key')
+
 def find_unbound_queues(bindings, queues):
+    """find queues with no bindings"""
     bound_queues = set()
     unbound_queues = set()
     for binding in bindings:
@@ -108,6 +127,7 @@ def find_unbound_queues(bindings, queues):
     return list(unbound_queues)
 
 def find_unbound_exchanges(bindings, queues, exchanges):
+    """find exchanges with no bindings or dead-letter queues"""
     bound_exchanges = set()
     unbound_exchanges = set()
     for binding in bindings:
@@ -123,20 +143,32 @@ def find_unbound_exchanges(bindings, queues, exchanges):
     return list(unbound_exchanges)
 
 def find_no_consumers_no_ttl(queues):
-    no_ttl = []
+    """find queues with no consumers and no ttl"""
+    no = []
     for queue in queues:
         if queue.get('consumers', None) == 0 and \
                 queue['arguments'].get('x-message-ttl') == None:
-            no_ttl.append(queue['name'])
-    return no_ttl
+            no.append(queue['name'])
+    return no
+
+def find_no_consumers_no_dlx(queues):
+    """find queues with no consumers and no dead letter exchange"""
+    no = []
+    for queue in queues:
+        if queue.get('consumers', None) == 0 and \
+                queue['arguments'].get('x-dead-letter-exchange') == None:
+            no.append(queue['name'])
+    return no
 
 def fetch_json(address, path, auth):
+    """return decoded JSON from HTTP API"""
     (host, port) = host_port(address, DEFAULT_PORT)
     url = 'http://%s:%s%s' % (host, port, path)
     r = requests.get(url, auth=auth)
     return r.json()
 
 def diff(expected, actual, get_key):
+    """return dict with missing, extra, and different keys based on expected and actual lists"""
     exp_map = {}
     act_map = {}
     for ex in expected:
@@ -158,6 +190,7 @@ def diff(expected, actual, get_key):
             )
 
 def get_remote_topology(address, auth):
+    """get exchanges, bindings, and queues from rabbitmq server"""
     exchanges = fetch_json(address, '/api/exchanges', auth)
     exchanges = list(
             clean_exchanges(
@@ -169,7 +202,9 @@ def get_remote_topology(address, auth):
 
     bindings = fetch_json(address, '/api/bindings', auth)
     bindings = list(
-            skip_empty_source(bindings)
+            clean_bindings(
+                skip_empty_source(bindings)
+                )
             )
 
     queues_raw = fetch_json(address, '/api/queues', auth)
@@ -185,12 +220,65 @@ def get_remote_topology(address, auth):
     return topology
 
 def get_topology(file_or_host, auth):
+    """try to load topology from local file or rabbitmq server"""
     try:
         with open(file_or_host) as f:
             return json.load(f)
     except IOError:
         pass
     return get_remote_topology(file_or_host, auth)
+
+def probe(address, auth):
+    """call overview api and follow redirect to determine port api is hosted on"""
+    (host, port) = host_port(address, DEFAULT_PORT)
+    url = 'http://%s:%s/api/overview' % (host, port)
+    r = requests.get(url, auth=auth)
+    url = urlparse.urlparse(r.url)
+    return (url.hostname, url.port)
+
+def put_api(host, port, auth, data, path, *args):
+    """call api with  PUT method"""
+    url = 'http://%s:%s' % (host, port)
+    url = url + (path % tuple([urllib.quote(arg, '') for arg in args]))
+    headers = {'Content-Type':'application/json'}
+    data=json.dumps(data)
+    return requests.put(url,
+            data=data,
+            auth=auth,
+            headers=headers,
+            )
+
+def post_api(host, port, auth, data, path, *args):
+    """call api with POST method"""
+    url = 'http://%s:%s' % (host, port)
+    url = url + (path % tuple([urllib.quote(arg, '') for arg in args]))
+    headers = {'Content-Type':'application/json'}
+    data=json.dumps(data)
+    return requests.post(url,
+            data=data,
+            auth=auth,
+            headers=headers,
+            )
+
+def create_exchange(host, port, auth, exchange):
+    """use api to create an exchange"""
+    return put_api(host, port, auth, exchange, '/api/exchanges/%s/%s',
+            exchange['vhost'],
+            exchange['name'])
+
+def create_queue(host, port, auth, queue):
+    """use api to create a queue"""
+    return put_api(host, port, auth, queue, '/api/queues/%s/%s',
+            queue['vhost'],
+            queue['name'])
+
+def create_binding(host, port, auth, binding):
+    """use api to create a binding"""
+    # TODO: support exchange->exchange binding?
+    return post_api(host, port, auth, binding, '/api/bindings/%s/e/%s/q/%s',
+            binding['vhost'],
+            binding['source'],
+            binding['destination'])
 
 def command_check(args):
     auth = (args.user, args.password)
@@ -203,6 +291,7 @@ def command_check(args):
                 unbound_queues=find_unbound_queues(bindings, queues),
                 unbound_exchanges=find_unbound_exchanges(bindings, queues, exchanges),
                 no_consumers_no_ttl=find_no_consumers_no_ttl(skip_non_permanent(queues)),
+                no_consumers_no_dlx=find_no_consumers_no_dlx(skip_non_permanent(queues)),
                 )
         return warnings
 
@@ -236,52 +325,6 @@ def command_diff(args):
     for (thing, getter) in ops:
         warnings[thing] = diff(expected[thing], actual[thing], getter)
     return warnings
-
-def probe(address, auth):
-    (host, port) = host_port(address, DEFAULT_PORT)
-    url = 'http://%s:%s/api/overview' % (host, port)
-    r = requests.get(url, auth=auth)
-    url = urlparse.urlparse(r.url)
-    return (url.hostname, url.port)
-
-def put_api(host, port, auth, data, path, *args):
-    url = 'http://%s:%s' % (host, port)
-    url = url + (path % tuple([urllib.quote(arg, '') for arg in args]))
-    headers = {'Content-Type':'application/json'}
-    data=json.dumps(data)
-    return requests.put(url,
-            data=data,
-            auth=auth,
-            headers=headers,
-            )
-
-def post_api(host, port, auth, data, path, *args):
-    url = 'http://%s:%s' % (host, port)
-    url = url + (path % tuple([urllib.quote(arg, '') for arg in args]))
-    headers = {'Content-Type':'application/json'}
-    data=json.dumps(data)
-    return requests.post(url,
-            data=data,
-            auth=auth,
-            headers=headers,
-            )
-
-def create_exchange(host, port, auth, exchange):
-    return put_api(host, port, auth, exchange, '/api/exchanges/%s/%s',
-            exchange['vhost'],
-            exchange['name'])
-
-def create_queue(host, port, auth, queue):
-    return put_api(host, port, auth, queue, '/api/queues/%s/%s',
-            queue['vhost'],
-            queue['name'])
-
-def create_binding(host, port, auth, binding):
-    # TODO: support exchange->exchange binding?
-    return post_api(host, port, auth, binding, '/api/bindings/%s/e/%s/q/%s',
-            binding['vhost'],
-            binding['source'],
-            binding['destination'])
 
 def command_sync(args):
     auth = (args.user, args.password)
