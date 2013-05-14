@@ -65,7 +65,7 @@ def filter_keys(dicts, *keys):
 
 def clean_exchanges(exchanges):
     """remove non-config keys from exchanges in list"""
-    return filter_keys(exchanges, 'message_stats_out', 'message_stats_in')
+    return filter_keys(exchanges, 'message_stats', 'message_stats_out', 'message_stats_in')
 
 def skip_internal_exchanges(exchanges):
     """generator that skips the internal rabbit exchanges"""
@@ -108,6 +108,7 @@ def clean_queues(queues):
             'active_consumers',
             'policy',
             'slave_nodes',
+            'status'
             )
 
 def clean_bindings(bindings):
