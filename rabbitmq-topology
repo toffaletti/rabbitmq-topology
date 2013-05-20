@@ -6,6 +6,7 @@
 # check topology.json
 # check mq201
 # graph topology.json > topology.dot
+# graph topology.json | dot -Tpng > topology.png
 # sync topology.json mq201
 
 import urlparse
