@@ -41,7 +41,7 @@ def graph_node(prefix, name, style):
 def graph_bind_nodes(source_type, source, destination_type, destination, style):
     """generate graph edge for rabbit binding"""
     return \
-            '{source_type}_{source} -> {dest_type}_{dest} {style};\n'.format(
+            '"{source_type}_{source}" -> "{dest_type}_{dest}" {style};\n'.format(
                     source_type=source_type,
                     source=source,
                     dest_type=destination_type,
